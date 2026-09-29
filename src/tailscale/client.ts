@@ -11,9 +11,22 @@ import {
   ConnectivityCheckParams,
   ConnectivityCheckResult,
   CliExecutionResult,
+  FunnelStatus,
+  FunnelManageParams,
+  FunnelManageResult,
+  FunnelEndpoint,
+  TailscaleServeStatusJson,
 } from "./types.js";
 import { logger } from "../utils/logger.js";
-import { isValidTarget, isValidPort, sanitizeCliArg } from "../utils/validator.js";
+import {
+  isValidTarget,
+  isValidPort,
+  isValidFunnelPort,
+  getDangerousPortWarning,
+  isValidMountPath,
+  isLocalHost,
+  sanitizeCliArg,
+} from "../utils/validator.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -363,9 +376,6 @@ export class TailscaleClient {
       };
     }
 
-    // Extract latency and relay status from ping response
-    // E.g.: "pong from worker-1 (100.100.1.2) via [203.0.113.1]:41641 in 14ms"
-    // or:   "pong from worker-1 (100.100.1.2) via DERP(fra) in 32ms"
     const latencyMatch = output.match(/in\s+([0-9.]+)(ms|µs|s)/i);
     let latencyMs: number | null = null;
 
@@ -474,6 +484,338 @@ export class TailscaleClient {
       success,
       output: output || (success ? "SSH connection verified successfully." : "SSH command returned non-zero exit code."),
       error: success ? undefined : `SSH check failed with exit code ${result.exitCode}`,
+    };
+  }
+
+  /**
+   * Queries the current status of Tailscale Funnel / Serve on the local node
+   */
+  public async getFunnelStatus(): Promise<FunnelStatus> {
+    let rawOutput: TailscaleServeStatusJson | null = null;
+    let nodeDnsName: string | null = null;
+
+    // Retrieve node's DNS name for constructing accurate public URLs
+    try {
+      const cliStatus = await this.getCliStatus();
+      if (cliStatus.Self?.DNSName) {
+        nodeDnsName = cliStatus.Self.DNSName.replace(/\.$/, "");
+      }
+    } catch {
+      // Continue even if getCliStatus fails
+    }
+
+    // Try `tailscale funnel status --json` first, then fallback to `tailscale serve status --json`
+    let res = await this.executeCli(["funnel", "status", "--json"]);
+    if (res.exitCode !== 0 || !res.stdout.trim()) {
+      res = await this.executeCli(["serve", "status", "--json"]);
+    }
+
+    if (res.stdout.trim()) {
+      try {
+        rawOutput = JSON.parse(res.stdout) as TailscaleServeStatusJson;
+      } catch {
+        logger.debug("Funnel status output was not valid JSON, returning raw text status");
+      }
+    }
+
+    const endpoints: FunnelEndpoint[] = [];
+
+    if (rawOutput && rawOutput.Web) {
+      for (const [hostPort, config] of Object.entries(rawOutput.Web)) {
+        const [domain, portStr] = hostPort.split(":");
+        const publicPort = portStr ? parseInt(portStr, 10) : 443;
+        const funnelEnabled = !!(rawOutput.AllowFunnel && (rawOutput.AllowFunnel[hostPort] || rawOutput.AllowFunnel[domain]));
+
+        if (domain && !nodeDnsName) {
+          nodeDnsName = domain;
+        }
+
+        if (config.Handlers) {
+          for (const [path, handler] of Object.entries(config.Handlers)) {
+            const target = handler.Proxy || handler.Path || handler.Text || "unknown";
+            const portSuffix = publicPort === 443 ? "" : `:${publicPort}`;
+            const cleanPath = path.startsWith("/") ? path : `/${path}`;
+
+            endpoints.push({
+              publicPort,
+              url: `https://${domain || nodeDnsName || "localhost"}${portSuffix}${cleanPath}`,
+              path: cleanPath,
+              target,
+              protocol: "https",
+              funnelEnabled,
+            });
+          }
+        }
+      }
+    }
+
+    const isFunnelActive = endpoints.some((e) => e.funnelEnabled);
+
+    return {
+      active: isFunnelActive,
+      nodeDnsName,
+      endpoints,
+      raw: rawOutput,
+    };
+  }
+
+  /**
+   * Manages Tailscale Funnel: status, expose, unexpose, or reset
+   */
+  public async manageFunnel(params: FunnelManageParams): Promise<FunnelManageResult> {
+    const { action, dryRun = false } = params;
+
+    switch (action) {
+      case "status":
+        return this.handleFunnelStatus();
+      case "expose":
+        return this.handleFunnelExpose(params, dryRun);
+      case "unexpose":
+        return this.handleFunnelUnexpose(params, dryRun);
+      case "reset":
+        return this.handleFunnelReset(params, dryRun);
+      default:
+        throw new Error(`Unsupported funnel action: ${action}`);
+    }
+  }
+
+  private async handleFunnelStatus(): Promise<FunnelManageResult> {
+    const status = await this.getFunnelStatus();
+    return {
+      action: "status",
+      success: true,
+      status,
+      message: status.active
+        ? `Tailscale Funnel is ACTIVE with ${status.endpoints.filter((e) => e.funnelEnabled).length} public endpoint(s).`
+        : "Tailscale Funnel is currently INACTIVE on this node.",
+    };
+  }
+
+  private async handleFunnelExpose(
+    params: FunnelManageParams,
+    dryRun: boolean
+  ): Promise<FunnelManageResult> {
+    const {
+      localPort,
+      publicPort = 443,
+      path = "/",
+      targetHost = "127.0.0.1",
+      protocol = "http",
+      allowDangerousPorts = false,
+    } = params;
+
+    if (!localPort || !isValidPort(localPort)) {
+      throw new Error(`Invalid localPort: "${localPort}". Must be an integer between 1 and 65535.`);
+    }
+
+    if (!isValidFunnelPort(publicPort)) {
+      throw new Error(
+        `Invalid publicPort: ${publicPort}. Tailscale Funnel only supports public ports: 443, 8443, or 10000.`
+      );
+    }
+
+    if (!isValidMountPath(path)) {
+      throw new Error(
+        `Invalid path: "${path}". Mount path must start with '/' and cannot contain traversal characters (e.g. '..').`
+      );
+    }
+
+    const securityWarnings: string[] = [];
+
+    // Check sensitive / dangerous ports
+    const danger = getDangerousPortWarning(localPort);
+    if (danger) {
+      if (!allowDangerousPorts) {
+        throw new Error(
+          `Security Guardrail: Port ${localPort} is identified as ${danger}. Exposing databases or admin interfaces to the public web via Funnel is high-risk. Set allowDangerousPorts: true if this exposure is intentionally approved.`
+        );
+      }
+      securityWarnings.push(
+        `SECURITY WARNING: Port ${localPort} (${danger}) is being exposed publicly. Ensure strong authentication is configured.`
+      );
+    }
+
+    // Check target host
+    if (!isLocalHost(targetHost)) {
+      securityWarnings.push(
+        `Target host "${targetHost}" is non-loopback. Funnel will proxy traffic across local subnet.`
+      );
+    }
+
+    const targetUrl = `${protocol}://${targetHost}:${localPort}`;
+
+    // Construct CLI command arguments
+    // e.g. tailscale funnel --bg --https=443 --set-path=/ http://127.0.0.1:3000
+    const args = ["funnel", "--bg"];
+    if (publicPort !== 443) {
+      args.push(`--https=${publicPort}`);
+    } else {
+      args.push("--https=443");
+    }
+
+    if (path !== "/") {
+      args.push(`--set-path=${path}`);
+    }
+
+    args.push(targetUrl);
+
+    // Resolve domain for public URL preview
+    let nodeDnsName = "your-node.tailnet.ts.net";
+    try {
+      const currentStatus = await this.getFunnelStatus();
+      if (currentStatus.nodeDnsName) {
+        nodeDnsName = currentStatus.nodeDnsName;
+      }
+    } catch {
+      // Ignore
+    }
+
+    const portSuffix = publicPort === 443 ? "" : `:${publicPort}`;
+    const cleanPath = path.startsWith("/") ? path : `/${path}`;
+    const expectedPublicUrl = `https://${nodeDnsName}${portSuffix}${cleanPath}`;
+
+    if (dryRun) {
+      logger.info(`Simulating funnel exposure for ${targetUrl} via ${expectedPublicUrl}`);
+      return {
+        action: "expose",
+        success: true,
+        dryRun: true,
+        command: `tailscale ${args.join(" ")}`,
+        publicUrl: expectedPublicUrl,
+        message: `[DRY-RUN] Funnel exposure plan verified. Would map ${expectedPublicUrl} -> ${targetUrl}.`,
+        securityWarnings: securityWarnings.length > 0 ? securityWarnings : undefined,
+      };
+    }
+
+    logger.info(`Executing Funnel exposure: tailscale ${args.join(" ")}`);
+    const res = await this.executeCli(args);
+
+    if (res.exitCode !== 0) {
+      const errLower = (res.stderr || res.stdout).toLowerCase();
+      let errorHelp = res.stderr || "Unknown CLI error";
+
+      if (errLower.includes("funnel") && (errLower.includes("not enabled") || errLower.includes("nodeattr"))) {
+        errorHelp +=
+          "\nTroubleshooting: Tailscale Funnel must be enabled in your Tailscale ACL policy. Add the 'funnel' attribute to nodeAttrs:\n" +
+          `"nodeAttrs": [{"target": ["autogroup:members"], "attr": ["funnel"]}]`;
+      } else if (errLower.includes("https") && errLower.includes("not enabled")) {
+        errorHelp +=
+          "\nTroubleshooting: HTTPS certificates must be enabled in your Tailnet Admin Console under DNS settings.";
+      }
+
+      return {
+        action: "expose",
+        success: false,
+        error: errorHelp,
+        command: `tailscale ${args.join(" ")}`,
+        message: `Failed to expose port ${localPort} via Tailscale Funnel.`,
+        securityWarnings: securityWarnings.length > 0 ? securityWarnings : undefined,
+      };
+    }
+
+    const newStatus = await this.getFunnelStatus();
+    return {
+      action: "expose",
+      success: true,
+      command: `tailscale ${args.join(" ")}`,
+      publicUrl: expectedPublicUrl,
+      status: newStatus,
+      message: `Successfully exposed ${targetUrl} to public web at ${expectedPublicUrl}`,
+      securityWarnings: securityWarnings.length > 0 ? securityWarnings : undefined,
+    };
+  }
+
+  private async handleFunnelUnexpose(
+    params: FunnelManageParams,
+    dryRun: boolean
+  ): Promise<FunnelManageResult> {
+    const { publicPort = 443 } = params;
+
+    if (!isValidFunnelPort(publicPort)) {
+      throw new Error(
+        `Invalid publicPort: ${publicPort}. Tailscale Funnel only supports public ports: 443, 8443, or 10000.`
+      );
+    }
+
+    const args = ["funnel", `--https=${publicPort}`, "off"];
+
+    if (dryRun) {
+      return {
+        action: "unexpose",
+        success: true,
+        dryRun: true,
+        command: `tailscale ${args.join(" ")}`,
+        message: `[DRY-RUN] Unexpose simulated. Would terminate public Funnel traffic on HTTPS port ${publicPort}.`,
+      };
+    }
+
+    logger.info(`Unexposing Funnel on port ${publicPort}: tailscale ${args.join(" ")}`);
+    const res = await this.executeCli(args);
+
+    if (res.exitCode !== 0) {
+      return {
+        action: "unexpose",
+        success: false,
+        command: `tailscale ${args.join(" ")}`,
+        error: res.stderr || "Failed to turn off funnel.",
+        message: `Failed to unexpose Funnel on port ${publicPort}.`,
+      };
+    }
+
+    const newStatus = await this.getFunnelStatus();
+    return {
+      action: "unexpose",
+      success: true,
+      command: `tailscale ${args.join(" ")}`,
+      status: newStatus,
+      message: `Successfully unexposed public Funnel on HTTPS port ${publicPort}.`,
+    };
+  }
+
+  private async handleFunnelReset(
+    params: FunnelManageParams,
+    dryRun: boolean
+  ): Promise<FunnelManageResult> {
+    const { confirm = false } = params;
+
+    if (!confirm && !dryRun) {
+      throw new Error(
+        "Destructive Action Blocked: Resetting Tailscale Funnel terminates all active public proxies and mount points. Pass confirm: true to proceed."
+      );
+    }
+
+    const args = ["funnel", "reset"];
+
+    if (dryRun) {
+      return {
+        action: "reset",
+        success: true,
+        dryRun: true,
+        command: `tailscale ${args.join(" ")}`,
+        message: "[DRY-RUN] Reset simulated. Would tear down all active Tailscale Funnel and Serve configurations.",
+      };
+    }
+
+    logger.warn("Executing full reset of Tailscale Funnel routes");
+    const res = await this.executeCli(args);
+
+    if (res.exitCode !== 0) {
+      return {
+        action: "reset",
+        success: false,
+        command: `tailscale ${args.join(" ")}`,
+        error: res.stderr || "Failed to reset funnel.",
+        message: "Failed to reset Tailscale Funnel configuration.",
+      };
+    }
+
+    const newStatus = await this.getFunnelStatus();
+    return {
+      action: "reset",
+      success: true,
+      command: `tailscale ${args.join(" ")}`,
+      status: newStatus,
+      message: "Successfully reset all Tailscale Funnel and Serve configurations.",
     };
   }
 }

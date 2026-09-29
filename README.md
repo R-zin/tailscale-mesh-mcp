@@ -43,6 +43,7 @@ Built with **TypeScript**, `@modelcontextprotocol/sdk`, and **Zod**, featuring a
 - **Stdio Protocol Isolation**: Strictly streams structured diagnostics to `process.stderr`, preserving `process.stdout` exclusively for JSON-RPC message framing.
 - **Dual-Engine Auto-Discovery**: Queries the local `tailscale` binary by default (zero cloud rate limits, sub-millisecond status), transparently falling back to the Tailscale REST API when running on remote instances or when daemon access is unavailable.
 - **Zero Command Injection**: Disallows shell interpolation. All binary executions utilize `execFile` with sanitized argument vectors (`string[]`) and RFC 1123 / IP validation.
+- **Strict Security Guardrails**: Built-in port protection blocks unauthenticated exposure of internal databases (e.g. Postgres 5432, Redis 6379, MySQL 3306) and daemon ports unless explicitly overridden. Destructive resets require confirmation flags.
 - **Safe Dry-Run Modes**: Operators and AI agents can simulate network operations, latency checks, and configuration alterations before affecting live node state.
 
 ---
@@ -61,15 +62,15 @@ tailscale-mesh-mcp/
     ├── index.ts              # MCP Server entrypoint & tool schema registration
     ├── tailscale/
     │   ├── client.ts         # Unified dual-engine Tailscale client (CLI + REST)
-    │   └── types.ts          # Strongly typed domain models (Device, Peer, API)
+    │   └── types.ts          # Strongly typed domain models (Device, Peer, Funnel)
     └── utils/
         ├── logger.ts         # Safe stderr-only logger for MCP Stdio compatibility
-        └── validator.ts      # Hostname, IPv4, IPv6, and Port security validation
+        └── validator.ts      # Hostname, IPv4, IPv6, Funnel, and Port security validation
 ```
 
 ---
 
-## Available Tools (Phase 1)
+## Available Tools
 
 ### 1. `list_devices`
 Discovers all nodes across the mesh tailnet with connectivity status, OS details, IP allocations, and latency telemetry.
@@ -90,13 +91,28 @@ Performs active network diagnostics across mesh peers using latency probes (`tai
   - `sshCommand` (string): Safe command executed via Tailscale SSH (default: `"exit 0"`).
   - `dryRun` (boolean): Simulates the check and validates arguments without initiating network packets.
 
+### 3. `manage_funnel`
+Inspects, exposes, unexposes, or resets public endpoints via Tailscale Funnel. Routes public internet traffic directly to local services with automatic Let's Encrypt TLS certificates.
+
+- **Parameters**:
+  - `action` (`"status"` | `"expose"` | `"unexpose"` | `"reset"`): Operation to perform.
+  - `localPort` (number): Local backend service port (required for `expose`, e.g. `3000`, `8080`).
+  - `publicPort` (`443` | `8443` | `10000`): Allowed public listening port (default: `443`).
+  - `path` (string): Public URL mount path prefix (default: `"/"`).
+  - `targetHost` (string): Local service host (default: `"127.0.0.1"`).
+  - `protocol` (`"http"` | `"https"`): Backend service protocol (default: `"http"`).
+  - `allowDangerousPorts` (boolean): Required override when attempting to expose sensitive ports (Postgres 5432, Redis 6379, MySQL 3306, MongoDB 27017, SSH 22, Docker 2375).
+  - `confirm` (boolean): Required confirmation flag when executing destructive `reset`.
+  - `dryRun` (boolean): Preview configuration and public URL without executing changes.
+
 ---
 
 ## Getting Started
 
 ### Prerequisites
 - Node.js >= 18.0.0
-- A Tailscale account and/or local `tailscale` CLI installed
+- Tailscale installed and running on the host machine
+- Tailscale Funnel attribute enabled in ACL policy (`nodeAttrs` with attribute `"funnel"`) and HTTPS enabled for public exposures
 
 ### Installation & Build
 
@@ -146,7 +162,7 @@ npm run build
 ## Roadmap
 
 - [x] **Phase 1**: Core runtime, CLI/REST dual-engine client, `list_devices`, `check_connectivity`.
-- [ ] **Phase 2**: `manage_funnel` (dynamic port exposure & unexposure with safety controls).
+- [x] **Phase 2**: `manage_funnel` (dynamic port exposure & unexposure with safety controls).
 - [ ] **Phase 3**: `audit_acl_rules` (HuJSON ACL parser, policy validation, diff preview).
 - [ ] **Phase 4**: NetBird mesh VPN provider adapter.
 

@@ -11,7 +11,7 @@ const tailscale = new TailscaleClient();
 // Create the Model Context Protocol (MCP) server instance
 const server = new McpServer({
   name: "tailscale-mesh-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 /**
@@ -162,6 +162,102 @@ server.tool(
           {
             type: "text",
             text: `Connectivity check error: ${error.message}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+/**
+ * Tool: manage_funnel
+ * Dynamically expose or unexpose local ports and services to the public internet using Tailscale Funnel.
+ */
+server.tool(
+  "manage_funnel",
+  "Manage Tailscale Funnel: inspect status, dynamically expose local ports to the public internet, unexpose public ports, or reset configuration.",
+  {
+    action: z
+      .enum(["status", "expose", "unexpose", "reset"])
+      .describe("Operation to perform: 'status' (view active public endpoints), 'expose' (route public web traffic to a local port), 'unexpose' (disable public routing for a port), or 'reset' (clear all funnel/serve routes)"),
+    localPort: z
+      .number()
+      .int()
+      .min(1)
+      .max(65535)
+      .optional()
+      .describe("Local backend service port to expose (required when action is 'expose', e.g. 3000, 8080)"),
+    publicPort: z
+      .union([z.literal(443), z.literal(8443), z.literal(10000)])
+      .optional()
+      .default(443)
+      .describe("Public listening port permitted by Tailscale Funnel: 443 (default), 8443, or 10000"),
+    path: z
+      .string()
+      .optional()
+      .default("/")
+      .describe("Public URL mount path prefix (default: '/')"),
+    targetHost: z
+      .string()
+      .optional()
+      .default("127.0.0.1")
+      .describe("Target host running the local service (default: '127.0.0.1')"),
+    protocol: z
+      .enum(["http", "https"])
+      .optional()
+      .default("http")
+      .describe("Backend service protocol (default: 'http')"),
+    allowDangerousPorts: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Bypass safety guardrails when exposing sensitive ports (e.g. database ports 5432, 6379, 3306 or SSH 22)"),
+    confirm: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Explicit confirmation required for destructive actions like 'reset'"),
+    dryRun: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Simulate the funnel operation without modifying daemon state or exposing routes"),
+  },
+  async (params) => {
+    logger.info(`Invoking manage_funnel (action: ${params.action})`);
+
+    if (params.action === "expose" && !params.localPort) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: "Validation Error: 'localPort' is required when action is 'expose'.",
+          },
+        ],
+      };
+    }
+
+    try {
+      const result = await tailscale.manageFunnel(params);
+
+      return {
+        isError: !result.success && !result.dryRun,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      logger.error("Failed to execute manage_funnel", error);
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: `Funnel management error: ${error.message}`,
           },
         ],
       };
