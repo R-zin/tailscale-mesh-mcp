@@ -212,3 +212,171 @@ export interface CliExecutionResult {
   stderr: string;
   exitCode: number;
 }
+
+/**
+ * Standard Tailscale ACL Rule
+ */
+export interface TailscaleAclRule {
+  action: "accept";
+  src: string[];
+  dst: string[];
+  users?: string[];
+  proto?: string;
+}
+
+/**
+ * Tailscale SSH Access Rule
+ */
+export interface TailscaleSshRule {
+  action: "accept" | "check";
+  src: string[];
+  dst: string[];
+  users: string[];
+  checkPeriod?: string;
+}
+
+/**
+ * Tailscale Node Attributes (e.g. Funnel permissions)
+ */
+export interface TailscaleNodeAttr {
+  target: string[];
+  attr: string[];
+  app?: Record<string, unknown>;
+}
+
+/**
+ * Tailscale Grant Rule (modern ACL syntax)
+ */
+export interface TailscaleGrantRule {
+  src: string[];
+  dst: string[];
+  app?: Record<string, unknown>;
+  ip?: string[];
+}
+
+/**
+ * Tailscale ACL Unit Test definition
+ */
+export interface TailscaleAclTest {
+  src: string;
+  accept?: string[];
+  deny?: string[];
+}
+
+/**
+ * Tailscale Access Control Policy File model (HuJSON structure)
+ */
+export interface TailscaleAclPolicy {
+  acls?: TailscaleAclRule[];
+  groups?: Record<string, string[]>;
+  tagOwners?: Record<string, string[]>;
+  hosts?: Record<string, string>;
+  tests?: TailscaleAclTest[];
+  autoApprovers?: {
+    routes?: Record<string, string[]>;
+    exitNode?: string[];
+  };
+  nodeAttrs?: TailscaleNodeAttr[];
+  ssh?: TailscaleSshRule[];
+  grants?: TailscaleGrantRule[];
+  postures?: Record<string, unknown>;
+  defaultSrcPosture?: string[];
+  derpMap?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+/**
+ * Severity ranking for security findings
+ */
+export type AclSeverity = "critical" | "high" | "medium" | "low" | "info";
+
+/**
+ * Specific security or syntax finding detected during ACL audit
+ */
+export interface AclFinding {
+  id: string;
+  severity: AclSeverity;
+  category: "security" | "syntax" | "best_practice" | "shadowing";
+  title: string;
+  message: string;
+  ruleIndex?: number;
+  rule?: unknown;
+  recommendation: string;
+}
+
+/**
+ * Structural metrics and telemetry for an ACL policy
+ */
+export interface AclPolicyStats {
+  aclsCount: number;
+  groupsCount: number;
+  tagOwnersCount: number;
+  hostsCount: number;
+  testsCount: number;
+  sshRulesCount: number;
+  grantsCount: number;
+  nodeAttrsCount: number;
+}
+
+/**
+ * Semantic differences and security impact analysis between two policies
+ */
+export interface AclSemanticDiff {
+  unifiedDiff: string;
+  hasChanges: boolean;
+  addedRulesCount: number;
+  removedRulesCount: number;
+  modifiedRulesCount: number;
+  riskDelta: "increased" | "decreased" | "neutral";
+  riskFactors: string[];
+  summary: string;
+}
+
+/**
+ * Result of submitting policy to Tailscale REST API v2 validate endpoint
+ */
+export interface AclApiValidationResult {
+  valid: boolean;
+  message?: string;
+  warnings?: string[];
+  errors?: string[];
+  raw?: unknown;
+}
+
+/**
+ * Complete result output of audit_acl_rules
+ */
+export interface AclAuditResult {
+  valid: boolean;
+  policySource: "provided" | "api";
+  securityScore: number; // 0 - 100
+  securityRating: "A" | "B" | "C" | "D" | "F";
+  stats: AclPolicyStats;
+  findings: AclFinding[];
+  summary: {
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+    info: number;
+    total: number;
+    headline: string;
+  };
+  diff?: AclSemanticDiff;
+  apiValidation?: AclApiValidationResult;
+  formattedHuJson?: string;
+  rawHuJson?: string;
+}
+
+/**
+ * Parameters for the audit_acl_rules tool
+ */
+export interface AuditAclParams {
+  policy?: string;
+  proposedPolicy?: string;
+  source?: "auto" | "api" | "provided";
+  validateWithApi?: boolean;
+  strict?: boolean;
+  formatOutput?: boolean;
+}
+

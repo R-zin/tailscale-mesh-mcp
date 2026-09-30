@@ -58,11 +58,16 @@ tailscale-mesh-mcp/
 ├── tsconfig.json             # TypeScript compiler settings (NodeNext)
 ├── tsup.config.ts            # Fast ESM bundle configuration
 ├── README.md                 # Project documentation
+├── tests/                    # Automated unit & integration tests
+│   └── acl.test.ts           # Test suite for HuJSON, ACL auditing, and diffs
 └── src/
     ├── index.ts              # MCP Server entrypoint & tool schema registration
     ├── tailscale/
+    │   ├── acl.ts            # Zero-trust policy auditor and security rule engine
     │   ├── client.ts         # Unified dual-engine Tailscale client (CLI + REST)
-    │   └── types.ts          # Strongly typed domain models (Device, Peer, Funnel)
+    │   ├── diff.ts           # Unified diff generator & semantic risk change detector
+    │   ├── hujson.ts         # Zero-dependency HuJSON tokenizer and parser
+    │   └── types.ts          # Strongly typed domain models (Device, Funnel, ACL)
     └── utils/
         ├── logger.ts         # Safe stderr-only logger for MCP Stdio compatibility
         └── validator.ts      # Hostname, IPv4, IPv6, Funnel, and Port security validation
@@ -104,6 +109,26 @@ Inspects, exposes, unexposes, or resets public endpoints via Tailscale Funnel. R
   - `allowDangerousPorts` (boolean): Required override when attempting to expose sensitive ports (Postgres 5432, Redis 6379, MySQL 3306, MongoDB 27017, SSH 22, Docker 2375).
   - `confirm` (boolean): Required confirmation flag when executing destructive `reset`.
   - `dryRun` (boolean): Preview configuration and public URL without executing changes.
+
+### 4. `audit_acl_rules`
+Deeply parses HuJSON Tailscale ACL policies, performs static zero-trust security audits, detects wildcard exposures and unowned tags, generates unified diff previews, and validates policies against Tailscale's official compiler API.
+
+- **Parameters**:
+  - `policy` (string, optional): Raw HuJSON or JSON policy text to audit. If omitted, automatically fetches the active tailnet policy via Tailscale REST API v2.
+  - `proposedPolicy` (string, optional): Proposed HuJSON policy to compare against the active or base policy. Computes git-style unified diffs and semantic risk factor deltas.
+  - `source` (`"auto"` | `"api"` | `"provided"`): Base policy source (default: `"auto"`).
+  - `validateWithApi` (boolean): If `true`, submits policy to Tailscale REST API `/acl/validate` compiler (requires `TAILSCALE_API_KEY`).
+  - `strict` (boolean): Returns `isError: true` if critical or high severity security vulnerabilities are discovered.
+  - `formatOutput` (boolean): Includes canonical, formatted HuJSON output in response (default: `true`).
+
+- **Security & Integrity Checks**:
+  - **Full-Mesh Wildcard Exposure**: Detects `*:* -> *:*` or unrestricted peer-to-peer rules.
+  - **Sensitive Port Leaks**: Detects member-wide access to database and daemon ports (Postgres 5432, Redis 6379, MySQL 3306, MongoDB 27017, SSH 22, Docker 2375, Kubernetes 6443).
+  - **TagOwners & Group Validation**: Detects unowned tags and undefined groups referenced across ACL rules and SSH policies.
+  - **Tailscale SSH Posture**: Flags unchecked root access (`users: ["root"]` without `action: "check"`).
+  - **Global Funnel Exposure**: Flags wildcard `nodeAttrs` granting Funnel public access to all members.
+  - **Redundancy & Shadowing**: Detects duplicated or shadowed rules eclipsed by earlier entries.
+  - **Zero-Trust Score**: Computes 0-100 security rating (A-F) based on security findings.
 
 ---
 
@@ -163,7 +188,7 @@ npm run build
 
 - [x] **Phase 1**: Core runtime, CLI/REST dual-engine client, `list_devices`, `check_connectivity`.
 - [x] **Phase 2**: `manage_funnel` (dynamic port exposure & unexposure with safety controls).
-- [ ] **Phase 3**: `audit_acl_rules` (HuJSON ACL parser, policy validation, diff preview).
+- [x] **Phase 3**: `audit_acl_rules` (HuJSON ACL parser, policy validation, diff preview).
 - [ ] **Phase 4**: NetBird mesh VPN provider adapter.
 
 ---

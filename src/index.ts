@@ -11,7 +11,7 @@ const tailscale = new TailscaleClient();
 // Create the Model Context Protocol (MCP) server instance
 const server = new McpServer({
   name: "tailscale-mesh-mcp",
-  version: "0.2.0",
+  version: "0.3.0",
 });
 
 /**
@@ -258,6 +258,83 @@ server.tool(
           {
             type: "text",
             text: `Funnel management error: ${error.message}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+/**
+ * Tool: audit_acl_rules
+ * Parses HuJSON ACL files, audits security policies for zero-trust posture, detects vulnerabilities, and previews diffs.
+ */
+server.tool(
+  "audit_acl_rules",
+  "Audit Tailscale ACL rules: parse HuJSON policy, check zero-trust security postures, detect wildcard risks and sensitive port leaks, validate against API, and preview semantic diffs.",
+  {
+    policy: z
+      .string()
+      .optional()
+      .describe(
+        "HuJSON or JSON text of the Tailscale ACL policy to audit. If omitted, fetches active policy from Tailscale REST API."
+      ),
+    proposedPolicy: z
+      .string()
+      .optional()
+      .describe(
+        "Proposed HuJSON policy to compare against the active or provided policy. Generates unified diff and semantic risk analysis."
+      ),
+    source: z
+      .enum(["auto", "api", "provided"])
+      .optional()
+      .default("auto")
+      .describe(
+        "Source for base policy: 'auto' (prefers provided policy, falls back to API), 'api' (fetches from Tailscale REST API), or 'provided'"
+      ),
+    validateWithApi: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Submit policy to Tailscale REST API v2 validate endpoint (/acl/validate) for official compiler verification (requires TAILSCALE_API_KEY)"
+      ),
+    strict: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "If true, returns isError: true when critical or high severity security findings are detected"
+      ),
+    formatOutput: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include formatted HuJSON output in response"),
+  },
+  async (params) => {
+    logger.info("Invoking audit_acl_rules tool");
+
+    try {
+      const result = await tailscale.auditAclRules(params);
+
+      return {
+        isError: !result.valid,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    } catch (error: any) {
+      logger.error("Failed to execute audit_acl_rules", error);
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: `ACL audit error: ${error.message}\n\nTips:\n1. If querying live tailnet ACLs, ensure TAILSCALE_API_KEY is configured in the environment.\n2. Or provide the policy text directly via the 'policy' parameter.\n3. Verify that the input conforms to HuJSON / JSON syntax.`,
           },
         ],
       };
