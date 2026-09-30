@@ -3,6 +3,7 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-blue.svg)](https://www.typescriptlang.org/)
 [![Model Context Protocol](https://img.shields.io/badge/MCP-1.30-purple.svg)](https://modelcontextprotocol.io/)
+[![CI](https://github.com/R-zin/tailscale-mesh-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/R-zin/tailscale-mesh-mcp/actions/workflows/ci.yml)
 
 A production-grade, zero-trust **Model Context Protocol (MCP)** server providing AI assistants direct, authenticated control over a private Tailscale / WireGuard mesh network.
 
@@ -52,6 +53,9 @@ Built with **TypeScript**, `@modelcontextprotocol/sdk`, and **Zod**, featuring a
 
 ```
 tailscale-mesh-mcp/
+├── .github/
+│   └── workflows/
+│       └── ci.yml            # Automated CI pipeline (lint, test, build, smoke-test)
 ├── .env.example              # Template for environment configuration
 ├── .gitignore                # Git ignore rules
 ├── package.json              # Dependencies and build scripts

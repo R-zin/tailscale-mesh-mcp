@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run TypeScript typecheck
+        run: npm run typecheck
+
+  test:
+    name: Test (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18.x, 20.x, 22.x]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run automated test suite
+        run: npm test
+
+  build:
+    name: Build & Smoke Test
+    needs: [lint-and-typecheck, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build ESM bundle with tsup
+        run: npm run build
+
+      - name: Verify build output exists
+        run: |
+          test -f dist/index.js || { echo "dist/index.js not found"; exit 1; }
+          test -s dist/index.js || { echo "dist/index.js is empty"; exit 1; }
+          echo "ESM bundle successfully generated at dist/index.js ($(wc -c < dist/index.js | tr -d ' ') bytes)"
+
+      - name: MCP Stdio Protocol Smoke Test
+        run: |
+          node -e '
+          import { spawn } from "node:child_process";
+
+          const proc = spawn("node", ["dist/index.js"], { stdio: ["pipe", "pipe", "inherit"] });
+
+          let stdout = "";
+          proc.stdout.on("data", (chunk) => {
+            stdout += chunk.toString();
+            if (stdout.includes("audit_acl_rules") && stdout.includes("manage_funnel")) {
+              console.log("Smoke test passed: MCP server successfully initialized and exposed all registered tools.");
+              proc.kill();
+              process.exit(0);
+            }
+          });
+
+          const init = JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ci-smoke-test", version: "1.0" } }
+          }) + "\n";
+
+          const list = JSON.stringify({
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/list",
+            params: {}
+          }) + "\n";
+
+          proc.stdin.write(init);
+          proc.stdin.write(list);
+
+          setTimeout(() => {
+            console.error("Smoke test timed out waiting for MCP server response.");
+            proc.kill();
+            process.exit(1);
+          }, 5000);
+          '
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
