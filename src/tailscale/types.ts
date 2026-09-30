@@ -134,6 +134,77 @@ export interface ConnectivityCheckResult {
 }
 
 /**
+ * Output format of `tailscale funnel status --json` or `tailscale serve status --json`
+ */
+export interface TailscaleServeStatusJson {
+  TCP?: Record<string, { HTTPS?: boolean; TCP?: boolean }>;
+  Web?: Record<
+    string,
+    {
+      Handlers?: Record<string, { Proxy?: string; Path?: string; Text?: string }>;
+    }
+  >;
+  AllowFunnel?: Record<string, boolean>;
+}
+
+/**
+ * Funnel actions supported by the manage_funnel tool
+ */
+export type FunnelAction = "status" | "expose" | "unexpose" | "reset";
+
+/**
+ * Normalized public endpoint exposed via Funnel
+ */
+export interface FunnelEndpoint {
+  publicPort: number;
+  url: string;
+  path: string;
+  target: string;
+  protocol: string;
+  funnelEnabled: boolean;
+}
+
+/**
+ * Normalized status of Funnel and Serve on local node
+ */
+export interface FunnelStatus {
+  active: boolean;
+  nodeDnsName: string | null;
+  endpoints: FunnelEndpoint[];
+  raw?: TailscaleServeStatusJson | null;
+}
+
+/**
+ * Parameters for manage_funnel tool
+ */
+export interface FunnelManageParams {
+  action: FunnelAction;
+  localPort?: number;
+  publicPort?: 443 | 8443 | 10000;
+  path?: string;
+  targetHost?: string;
+  protocol?: "http" | "https";
+  allowDangerousPorts?: boolean;
+  confirm?: boolean;
+  dryRun?: boolean;
+}
+
+/**
+ * Result of manage_funnel operations
+ */
+export interface FunnelManageResult {
+  action: FunnelAction;
+  success: boolean;
+  message: string;
+  publicUrl?: string;
+  command?: string;
+  status?: FunnelStatus;
+  securityWarnings?: string[];
+  dryRun?: boolean;
+  error?: string;
+}
+
+/**
  * Result of local CLI execution
  */
 export interface CliExecutionResult {
