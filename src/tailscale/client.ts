@@ -16,8 +16,16 @@ import {
   FunnelManageResult,
   FunnelEndpoint,
   TailscaleServeStatusJson,
+  TailscaleAclPolicy,
+  AclAuditResult,
+  AuditAclParams,
+  AclApiValidationResult,
+  AclSemanticDiff,
 } from "./types.js";
 import { logger } from "../utils/logger.js";
+import { parseHuJson, formatHuJson, huJsonToJson } from "./hujson.js";
+import { createUnifiedDiff, analyzePolicyDiff } from "./diff.js";
+import { auditAclPolicy } from "./acl.js";
 import {
   isValidTarget,
   isValidPort,
@@ -176,6 +184,55 @@ export class TailscaleClient {
       }
 
       return (await response.json()) as T;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Performs an authenticated request to Tailscale REST API returning raw text and headers
+   */
+  public async fetchApiText(
+    endpoint: string,
+    options: RequestInit = {}
+  ): Promise<{ text: string; etag: string | null; status: number }> {
+    if (!this.apiKey) {
+      throw new Error(
+        "Tailscale API key missing. Set TAILSCALE_API_KEY environment variable to use REST API features."
+      );
+    }
+
+    const cleanEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+    const url = `${this.apiBaseUrl}${cleanEndpoint}`;
+
+    logger.debug(`REST API Request (Text): ${options.method || "GET"} ${url}`);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "User-Agent": "tailscale-mesh-mcp/0.3.0",
+          ...options.headers,
+        },
+      });
+
+      const text = await response.text();
+      if (!response.ok) {
+        throw new Error(
+          `Tailscale API error (${response.status} ${response.statusText}): ${text || "No response body"}`
+        );
+      }
+
+      return {
+        text,
+        etag: response.headers.get("etag"),
+        status: response.status,
+      };
     } finally {
       clearTimeout(timer);
     }
@@ -816,6 +873,260 @@ export class TailscaleClient {
       command: `tailscale ${args.join(" ")}`,
       status: newStatus,
       message: "Successfully reset all Tailscale Funnel and Serve configurations.",
+    };
+  }
+
+  /**
+   * Retrieves the current tailnet ACL policy file from Tailscale REST API v2
+   */
+  public async getAcl(options: { format?: "hujson" | "json" } = {}): Promise<{
+    hujson: string;
+    policy: TailscaleAclPolicy;
+    etag: string | null;
+  }> {
+    const acceptHeader =
+      options.format === "json"
+        ? "application/json"
+        : "application/hujson, application/json;q=0.9, text/plain;q=0.8";
+
+    const res = await this.fetchApiText(
+      `/tailnet/${encodeURIComponent(this.tailnet)}/acl`,
+      {
+        headers: {
+          Accept: acceptHeader,
+        },
+      }
+    );
+
+    const policy = parseHuJson<TailscaleAclPolicy>(res.text);
+    return {
+      hujson: res.text,
+      policy,
+      etag: res.etag,
+    };
+  }
+
+  /**
+   * Submits HuJSON policy to Tailscale REST API v2 validate endpoint (/acl/validate)
+   */
+  public async validateAclWithApi(hujson: string): Promise<AclApiValidationResult> {
+    try {
+      const res = await this.fetchApiText(
+        `/tailnet/${encodeURIComponent(this.tailnet)}/acl/validate`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/hujson",
+            Accept: "application/json",
+          },
+          body: hujson,
+        }
+      );
+
+      // Tailscale returns {} or empty on valid
+      if (res.status === 200) {
+        let warnings: string[] = [];
+        try {
+          const parsed = JSON.parse(res.text);
+          if (parsed.warnings && Array.isArray(parsed.warnings)) {
+            warnings = parsed.warnings;
+          }
+        } catch {
+          // Empty or non-JSON 200 response means valid
+        }
+        return {
+          valid: true,
+          message: "Policy validated successfully by Tailscale API compiler.",
+          warnings: warnings.length > 0 ? warnings : undefined,
+        };
+      }
+
+      return {
+        valid: false,
+        message: `Tailscale API validation returned status ${res.status}`,
+        errors: [res.text],
+      };
+    } catch (err: any) {
+      return {
+        valid: false,
+        message: `Tailscale API validation failed: ${err.message}`,
+        errors: [err.message],
+      };
+    }
+  }
+
+  /**
+   * Audits Tailscale ACL rules, validating syntax, evaluating zero-trust posture, and previewing diffs
+   */
+  public async auditAclRules(params: AuditAclParams = {}): Promise<AclAuditResult> {
+    const {
+      policy: inputPolicy,
+      proposedPolicy: inputProposedPolicy,
+      source = "auto",
+      validateWithApi = false,
+      strict = false,
+      formatOutput = true,
+    } = params;
+
+    let rawHuJson = "";
+    let policySource: "provided" | "api" = "provided";
+
+    // 1. Resolve base policy
+    if (inputPolicy && inputPolicy.trim().length > 0) {
+      rawHuJson = inputPolicy.trim();
+      policySource = "provided";
+    } else if (source === "api" || (source === "auto" && this.apiKey)) {
+      try {
+        const remoteAcl = await this.getAcl();
+        rawHuJson = remoteAcl.hujson;
+        policySource = "api";
+      } catch (err: any) {
+        throw new Error(
+          `Failed to fetch active ACL policy from Tailscale API: ${err.message}. Alternatively, provide policy text in 'policy' parameter.`
+        );
+      }
+    } else {
+      throw new Error(
+        "No ACL policy provided and TAILSCALE_API_KEY is not configured. Provide policy HuJSON in 'policy' parameter or set TAILSCALE_API_KEY in environment."
+      );
+    }
+
+    // 2. Parse base policy
+    let parsedPolicy: TailscaleAclPolicy;
+    try {
+      parsedPolicy = parseHuJson<TailscaleAclPolicy>(rawHuJson);
+    } catch (parseErr: any) {
+      return {
+        valid: false,
+        policySource,
+        securityScore: 0,
+        securityRating: "F",
+        stats: {
+          aclsCount: 0,
+          groupsCount: 0,
+          tagOwnersCount: 0,
+          hostsCount: 0,
+          testsCount: 0,
+          sshRulesCount: 0,
+          grantsCount: 0,
+          nodeAttrsCount: 0,
+        },
+        findings: [
+          {
+            id: "HUJSON_PARSE_ERROR",
+            severity: "critical",
+            category: "syntax",
+            title: "HuJSON / JSON Syntax Error",
+            message: parseErr.message,
+            recommendation:
+              "Ensure valid HuJSON syntax with matching brackets, valid comments, and proper string quoting.",
+          },
+        ],
+        summary: {
+          critical: 1,
+          high: 0,
+          medium: 0,
+          low: 0,
+          info: 0,
+          total: 1,
+          headline: "Policy failed to parse due to HuJSON syntax error.",
+        },
+        rawHuJson,
+      };
+    }
+
+    // 3. Run static security audit
+    const auditRes = auditAclPolicy(parsedPolicy);
+
+    // 4. Optional Diff Preview against proposed policy
+    let diff: AclSemanticDiff | undefined;
+    if (inputProposedPolicy && inputProposedPolicy.trim().length > 0) {
+      try {
+        const proposedParsed = parseHuJson<TailscaleAclPolicy>(inputProposedPolicy);
+        const formattedBase = formatHuJson(rawHuJson);
+        const formattedProposed = formatHuJson(inputProposedPolicy);
+        const unifiedDiff = createUnifiedDiff(formattedBase, formattedProposed);
+        diff = analyzePolicyDiff(parsedPolicy, proposedParsed, unifiedDiff);
+      } catch (propErr: any) {
+        auditRes.findings.push({
+          id: "PROPOSED_POLICY_PARSE_ERROR",
+          severity: "high",
+          category: "syntax",
+          title: "Proposed Policy Syntax Error",
+          message: `Proposed policy could not be parsed for diff preview: ${propErr.message}`,
+          recommendation: "Fix syntax errors in proposed policy.",
+        });
+      }
+    }
+
+    // 5. Optional API validation
+    let apiValidation: AclApiValidationResult | undefined;
+    if (validateWithApi) {
+      if (this.apiKey) {
+        apiValidation = await this.validateAclWithApi(rawHuJson);
+        if (!apiValidation.valid && apiValidation.errors) {
+          for (const err of apiValidation.errors) {
+            auditRes.findings.push({
+              id: "TAILSCALE_API_VALIDATION_ERROR",
+              severity: "critical",
+              category: "syntax",
+              title: "Tailscale API Compiler Validation Error",
+              message: err,
+              recommendation: "Address Tailscale official policy compiler error.",
+            });
+          }
+        }
+      } else {
+        apiValidation = {
+          valid: false,
+          message:
+            "API validation skipped: TAILSCALE_API_KEY environment variable is not configured.",
+        };
+      }
+    }
+
+    // Summary counts
+    const critical = auditRes.findings.filter((f) => f.severity === "critical").length;
+    const high = auditRes.findings.filter((f) => f.severity === "high").length;
+    const medium = auditRes.findings.filter((f) => f.severity === "medium").length;
+    const low = auditRes.findings.filter((f) => f.severity === "low").length;
+    const info = auditRes.findings.filter((f) => f.severity === "info").length;
+
+    let headline = `Security Rating: ${auditRes.securityRating} (${auditRes.securityScore}/100). Found ${auditRes.findings.length} findings (${critical} critical, ${high} high, ${medium} medium).`;
+    if (critical > 0) {
+      headline = `SECURITY ALERT: ${critical} critical vulnerabilities found in Tailscale ACL policy! Score: ${auditRes.securityScore}/100 (Rating ${auditRes.securityRating}).`;
+    } else if (high > 0) {
+      headline = `SECURITY WARNING: ${high} high-risk findings detected in Tailscale ACL policy. Score: ${auditRes.securityScore}/100 (Rating ${auditRes.securityRating}).`;
+    } else if (auditRes.findings.length === 0) {
+      headline =
+        "EXCELLENT: Tailscale ACL policy conforms strictly to zero-trust standards with 0 findings.";
+    }
+
+    let isValid = auditRes.valid;
+    if (strict && (critical > 0 || high > 0)) {
+      isValid = false;
+    }
+
+    return {
+      valid: isValid,
+      policySource,
+      securityScore: auditRes.securityScore,
+      securityRating: auditRes.securityRating,
+      stats: auditRes.stats,
+      findings: auditRes.findings,
+      summary: {
+        critical,
+        high,
+        medium,
+        low,
+        info,
+        total: auditRes.findings.length,
+        headline,
+      },
+      diff,
+      apiValidation,
+      formattedHuJson: formatOutput ? formatHuJson(rawHuJson) : undefined,
+      rawHuJson: formatOutput ? undefined : rawHuJson,
     };
   }
 }
